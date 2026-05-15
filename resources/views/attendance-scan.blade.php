@@ -60,27 +60,78 @@
         const statusDesc = document.getElementById('status-desc');
 
         let faceMatcher;
-        let isProcessing = false; // Mencegah spam API
+        let isProcessing = false;
 
-        // 1. Load Model & Data Wajah
+        // --- PENGATURAN LOKASI (GEOFENCING) ---
+        const TARGET_LAT = -6.154613;
+        const TARGET_LNG = 106.689156;
+        const MAX_RADIUS_METERS = 50;
+
+        let isLocationValid = false;
+
+        function getDistanceFromLatLonInM(lat1, lon1, lat2, lon2) {
+            const R = 6371000;
+            const dLat = (lat2 - lat1) * (Math.PI / 180);
+            const dLon = (lon2 - lon1) * (Math.PI / 180);
+            const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                Math.cos(lat1 * (Math.PI / 180)) * Math.cos(lat2 * (Math.PI / 180)) *
+                Math.sin(dLon / 2) * Math.sin(dLon / 2);
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+            return Math.round(R * c);
+        }
+
+        // 1. Cek Lokasi
+        function checkLocation() {
+            loaderText.innerText = "Memeriksa Lokasi GPS...";
+
+            if (navigator.geolocation) {
+                navigator.geolocation.getCurrentPosition(
+                    (position) => {
+                        const userLat = position.coords.latitude;
+                        const userLng = position.coords.longitude;
+                        const distance = getDistanceFromLatLonInM(userLat, userLng, TARGET_LAT, TARGET_LNG);
+
+                        if (distance <= MAX_RADIUS_METERS) {
+                            isLocationValid = true;
+                            initSystem();
+                        } else {
+                            loader.style.display = 'none';
+                            updateUI('error', 'Di Luar Area',
+                                `Jarak Anda ${distance} meter dari target. Maksimal ${MAX_RADIUS_METERS}m.`);
+                        }
+                    },
+                    (error) => {
+                        loader.style.display = 'none';
+                        updateUI('error', 'Akses Lokasi Ditolak',
+                            'Izinkan akses lokasi GPS di browser Anda untuk absen.');
+                    }, {
+                        enableHighAccuracy: true
+                    }
+                );
+            } else {
+                updateUI('error', 'Tidak Didukung', 'Browser Anda tidak mendukung fitur GPS.');
+            }
+        }
+
+        // 2. Load Model & Data Wajah
         async function initSystem() {
             try {
                 const MODEL_URL = '/models';
 
                 loaderText.innerText = "Memuat Model AI...";
+
+                // TAMBAHAN: Kita muat juga FaceExpressionNet di sini
                 await Promise.all([
                     faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL),
                     faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
-                    faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL)
+                    faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
+                    faceapi.nets.faceExpressionNet.loadFromUri(MODEL_URL) // <--- Ini model Anti-Kecurangan
                 ]);
 
                 loaderText.innerText = "Membaca Data Wajah Siswa...";
 
-                // Buat LabeledFaceDescriptors dari data database
                 const labeledDescriptors = studentsData.map(student => {
-                    // Konversi array kembali menjadi Float32Array sesuai standar AI
                     const descriptorArray = new Float32Array(student.face_descriptor);
-                    // Kita gabungkan ID dan Nama untuk nanti di-split
                     return new faceapi.LabeledFaceDescriptors(
                         student.id + '|' + student.user.name,
                         [descriptorArray]
@@ -90,7 +141,6 @@
                 if (labeledDescriptors.length === 0) {
                     alert("Belum ada data wajah siswa di database!");
                 } else {
-                    // Inisialisasi FaceMatcher dengan threshold kecocokan 0.55 (makin kecil makin ketat)
                     faceMatcher = new faceapi.FaceMatcher(labeledDescriptors, 0.55);
                 }
 
@@ -103,7 +153,7 @@
             }
         }
 
-        // 2. Nyalakan Kamera
+        // 3. Nyalakan Kamera
         function startVideo() {
             navigator.mediaDevices.getUserMedia({
                     video: {}
@@ -111,15 +161,15 @@
                 .then(stream => {
                     video.srcObject = stream;
                     loader.style.display = 'none';
+                    resetUI();
                 })
                 .catch(err => {
                     alert("Gagal mengakses kamera: " + err);
                 });
         }
 
-        // 3. Looping Deteksi saat video menyala
+        // 4. Looping Deteksi
         video.addEventListener('play', () => {
-            // Sesuaikan ukuran canvas dengan video
             const displaySize = {
                 width: video.videoWidth,
                 height: video.videoHeight
@@ -127,37 +177,57 @@
             faceapi.matchDimensions(overlay, displaySize);
 
             setInterval(async () => {
-                if (!faceMatcher) return;
+                if (!faceMatcher || !isLocationValid) return;
 
-                // Deteksi semua wajah di depan kamera
+                // TAMBAHAN: Kita tambahkan withFaceExpressions()
                 const detections = await faceapi.detectAllFaces(video)
                     .withFaceLandmarks()
+                    .withFaceExpressions() // <--- Baca ekspresi wajah
                     .withFaceDescriptors();
 
                 const resizedDetections = faceapi.resizeResults(detections, displaySize);
 
-                // Bersihkan canvas dari kotak sebelumnya
                 overlay.getContext('2d').clearRect(0, 0, overlay.width, overlay.height);
-
-                // Gambar kotak wajah untuk visual
                 faceapi.draw.drawDetections(overlay, resizedDetections);
 
-                // Proses setiap wajah yang terdeteksi
+                let faceInFrame = false;
+
                 for (const detection of resizedDetections) {
                     const bestMatch = faceMatcher.findBestMatch(detection.descriptor);
 
-                    if (bestMatch.label !== 'unknown' && !isProcessing) {
-                        const [studentId, studentName] = bestMatch.label.split('|');
+                    if (bestMatch.label !== 'unknown') {
+                        faceInFrame = true;
 
-                        // Kunci agar tidak melakukan request berkali-kali untuk orang yang sama
-                        isProcessing = true;
-                        processAttendance(studentId, studentName);
+                        if (!isProcessing) {
+                            const [studentId, studentName] = bestMatch.label.split('|');
+
+                            // LOGIKA ANTI-KECURANGAN (LIVENESS DETECTION)
+                            // Cek apakah probabilitas ekspresi senyum (happy) di atas 60% (0.6)
+                            const isSmiling = detection.expressions.happy > 0.6;
+
+                            if (isSmiling) {
+                                isProcessing = true;
+                                processAttendance(studentId, studentName);
+                            } else {
+                                // Jika wajah cocok tapi belum senyum, suruh senyum!
+                                updateUI('warning', 'Wajah Dikenali',
+                                    `Halo ${studentName}, silakan TERSENYUM untuk memvalidasi absen.`
+                                    );
+                            }
+                        }
                     }
                 }
-            }, 1000); // Lakukan scan setiap 1 detik untuk menghemat performa
+
+                // Reset UI otomatis jika wajah hilang dari kamera dan belum diproses
+                if (!faceInFrame && !isProcessing && statusBox.classList.contains(
+                    'border-yellow-500')) {
+                    resetUI();
+                }
+
+            }, 1000);
         });
 
-        // 4. Kirim Data ke Laravel
+        // 5. Kirim Data ke Laravel
         function processAttendance(studentId, studentName) {
             updateUI('loading', `Memproses...`, studentName);
 
@@ -178,8 +248,6 @@
                     } else {
                         updateUI('warning', 'Sudah Absen!', data.message);
                     }
-
-                    // Beri jeda 3 detik sebelum bisa scan wajah lain
                     setTimeout(() => {
                         resetUI();
                         isProcessing = false;
@@ -194,7 +262,7 @@
                 });
         }
 
-        // 5. Fungsi Mengubah Tampilan UI
+        // 6. Fungsi Mengubah Tampilan UI
         function updateUI(type, title, desc) {
             statusBox.className = "w-full p-4 rounded-xl border-2 transition-all duration-300";
 
@@ -221,6 +289,7 @@
         }
 
         function resetUI() {
+            if (!isLocationValid) return;
             statusBox.className = "w-full p-4 rounded-xl border-2 border-gray-600 bg-gray-700 transition-all duration-300";
             statusIcon.innerText = "📷";
             statusTitle.className = "text-xl font-bold text-white mb-1";
@@ -228,8 +297,7 @@
             statusDesc.innerText = "Silakan menatap ke arah kamera";
         }
 
-        // Mulai sistem
-        initSystem();
+        checkLocation();
     </script>
 </body>
 
